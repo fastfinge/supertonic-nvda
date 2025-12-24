@@ -1,3 +1,17 @@
+[project]
+name = "supertonic-nvda"
+version = "1.0.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4.10",
+    "pyright>=1.1.402",
+    "scons>=4.10.1",
+    "markdown>=3.8.2",
+]
+
 [tool.ruff]
 line-length = 110
 

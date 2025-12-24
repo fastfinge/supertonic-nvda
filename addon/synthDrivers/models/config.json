@@ -1,0 +1,5 @@
+{
+  "model_name": "Supertonic",
+  "model_type": "onnx",
+  "description": "This is a stub config for Hugging Face download counting. The actual model is located at onnx/"
+}

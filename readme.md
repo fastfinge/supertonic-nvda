@@ -12,6 +12,12 @@ Supertonic is a high-performance, on-device TTS powered by ONNX Runtime. However
 - Multiple voice styles.
 - Control over speech speed and quality.
 
+## Issues
+
+- Speed only pretends to work. Increasing speed makes it skip words instead of actually speaking faster.
+- Pitch can't be changed
+- I suspect we don't need to bundle quite as many Python packages as we do, but NVDA includes weird versions of things and I'm scared
+
 ## Settings
 
 The following settings are available in NVDA's Speech settings dialog when Supertonic is selected as the synthesizer:

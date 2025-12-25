@@ -122,7 +122,8 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				voice_style=voice_style,
 				speed=speed,
 				total_steps=quality,
-				max_chunk_length=100000,
+				max_chunk_length=300,
+				silence_duration=0.1,
 				return_alignment=True
 			)
 			

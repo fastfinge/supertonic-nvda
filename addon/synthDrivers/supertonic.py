@@ -1,3 +1,4 @@
+import difflib
 import os
 import sys
 import threading
@@ -17,6 +18,33 @@ import supertonic
 from synthDriverHandler import synthIndexReached, synthDoneSpeaking
 from autoSettingsUtils.driverSetting import NumericDriverSetting
 from speech.commands import IndexCommand
+from supertonic.utils import chunk_text
+
+def _build_remap(source_text, target_text):
+	remap = [0] * (len(source_text) + 1)
+	if not source_text:
+		return remap
+
+	matcher = difflib.SequenceMatcher(a=source_text, b=target_text, autojunk=False)
+	for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+		if tag == "equal":
+			for i in range(i1, i2):
+				remap[i] = j1 + (i - i1)
+		elif tag in ("replace", "delete"):
+			for i in range(i1, i2):
+				remap[i] = j1
+		# "insert" has no source indices to map.
+
+	remap[len(source_text)] = len(target_text)
+	last = 0
+	for i in range(len(remap)):
+		if remap[i] == 0 and i != 0:
+			remap[i] = last
+		if remap[i] < last:
+			remap[i] = last
+		last = remap[i]
+
+	return remap
 
 class SynthDriver(synthDriverHandler.SynthDriver):
 	"""
@@ -76,7 +104,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				self._process_job(generation, text, index_map, voice_name, rate, quality)
 			except Exception:
 				log.error("Error in Supertonic worker", exc_info=True)
-				synthDoneSpeaking.notify()
+				synthDoneSpeaking.notify(synth=self)
 			finally:
 				self._job_queue.task_done()
 
@@ -84,18 +112,30 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 		try:
 			# Sanitize text and remap indices
 			processor = self._tts.model.text_processor
-			new_text = ""
-			remap = [0] * (len(text) + 1)
+			filtered_chars = []
+			remap_filtered = [0] * (len(text) + 1)
 			
 			for i, char in enumerate(text):
-				remap[i] = len(new_text)
+				remap_filtered[i] = len(filtered_chars)
 				is_valid, _ = processor.validate_text(char)
 				if is_valid:
-					new_text += char
-				# If invalid, it is skipped, and remap[i] remains pointing to current len(new_text)
+					filtered_chars.append(char)
+				# If invalid, it is skipped, and remap_filtered[i] remains pointing to current len(filtered_chars)
 				# which is the position effectively "after" the previous valid char.
 			
-			remap[len(text)] = len(new_text)
+			remap_filtered[len(text)] = len(filtered_chars)
+			filtered_text = "".join(filtered_chars)
+
+			if not filtered_text.strip():
+				synthDoneSpeaking.notify(synth=self)
+				return
+
+			max_chunk_length = 10000
+			silence_duration = 0.1
+			chunks = chunk_text(filtered_text, max_chunk_length)
+			processed_chunks = [processor._preprocess_text(chunk) for chunk in chunks]
+			processed_text = "".join(processed_chunks)
+			remap_processed = _build_remap(filtered_text, processed_text)
 			
 			# Rebuild index map with new offsets
 			new_index_map = []
@@ -103,10 +143,15 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				# Clamp offset to bounds just in case
 				if offset > len(text):
 					offset = len(text)
-				new_offset = remap[offset]
+				filtered_offset = remap_filtered[offset]
+				if filtered_offset > len(filtered_text):
+					filtered_offset = len(filtered_text)
+				new_offset = remap_processed[filtered_offset]
+				if new_offset > len(processed_text):
+					new_offset = len(processed_text)
 				new_index_map.append((new_offset, idx))
 			
-			text = new_text
+			text = filtered_text
 			index_map = new_index_map
 
 			voice_style = self._tts.get_voice_style(voice_name)
@@ -122,12 +167,25 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				voice_style=voice_style,
 				speed=speed,
 				total_steps=quality,
-				max_chunk_length=300,
-				silence_duration=0.1,
+				max_chunk_length=max_chunk_length,
+				silence_duration=silence_duration,
 				return_alignment=True
 			)
 			
-			all_durations = np.concatenate(dur_lists)
+			cum_durations_list = []
+			elapsed = 0.0
+			for i, dur in enumerate(dur_lists):
+				flat = np.ravel(dur)
+				if flat.size == 0:
+					continue
+				chunk_cumsum = np.cumsum(flat) + elapsed
+				cum_durations_list.append(chunk_cumsum)
+				if i < len(dur_lists) - 1:
+					elapsed = chunk_cumsum[-1] + silence_duration
+				else:
+					elapsed = chunk_cumsum[-1]
+
+			all_durations = np.concatenate(cum_durations_list) if cum_durations_list else np.array([], dtype=np.float32)
 			bytes_per_sec = self._tts.sample_rate * 2
 			
 			audio_data = np.clip(wav.squeeze() * 32767, -32768, 32767).astype(np.int16).tobytes()
@@ -176,7 +234,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				if offset == 0:
 					# Fire immediately
 					for idx in indices:
-						synthIndexReached.notify(index=idx)
+						synthIndexReached.notify(synth=self, index=idx)
 					continue
 				
 				# Feed audio up to this offset
@@ -187,13 +245,13 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 					# Define callback
 					def on_done(idxs=indices):
 						for i in idxs:
-							synthIndexReached.notify(index=i)
+							synthIndexReached.notify(synth=self, index=i)
 					
 					self._player.feed(chunk, onDone=on_done)
 					last_fed_byte = offset
 				else:
 					for idx in indices:
-						synthIndexReached.notify(index=idx)
+						synthIndexReached.notify(synth=self, index=idx)
 			
 			# Feed remaining audio
 			if last_fed_byte < len(audio_data):
@@ -202,7 +260,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 			
 			# Wait for playback to finish
 			self._player.idle()
-			synthDoneSpeaking.notify()
+			synthDoneSpeaking.notify(synth=self)
 
 		except Exception as e:
 			raise e
@@ -218,7 +276,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 				index_map.append((len(text), item.index))
 
 		if not text.strip():
-			synthDoneSpeaking.notify()
+			synthDoneSpeaking.notify(synth=self)
 			return
 
 		with self._generation_lock:
